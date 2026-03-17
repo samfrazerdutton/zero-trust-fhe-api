@@ -64,8 +64,8 @@ class cuFHE:
               f"{info['vram_gb']:.1f}GB VRAM | {info['sm_count']} SMs")
 
         # Load kernels
-        self._enc      = mod.get_function("_Z11bfv_encryptPKjS0_PjS1_i")
-        self._dec      = mod.get_function("_Z11bfv_decryptPKjPji")
+        self._enc_pk   = mod.get_function("bfv_encrypt_pk")
+        self._dec      = mod.get_function("bfv_decrypt")
         self._kadd     = mod.get_function("_Z8poly_addPKjS0_Pji")
         self._ksub     = mod.get_function("_Z8poly_subPKjS0_Pji")
         self._kscalar  = mod.get_function("_Z15poly_scalar_mulPKjjPji")
@@ -88,21 +88,34 @@ class cuFHE:
         self.d_psi_pow     = cp.asarray(psi_pow)
         self.d_inv_psi_pow = cp.asarray(inv_psi_pow)
 
-        # Secret key
-        self.sk = np.random.randint(0, 2, N, dtype=np.uint32)
-
-        # Relin keys
-        a    = np.random.randint(0, Q, N, dtype=np.uint64)
-        e    = np.random.randint(0, 3,  N, dtype=np.uint64)
-        sk64 = self.sk.astype(np.uint64)
-        sk2  = sk64 * sk64 % Q
-        rlk0 = (sk2 - a * sk64 % Q + e + 2*Q) % Q
-        self.d_rlk0 = cp.asarray(rlk0.astype(np.uint32))
-        self.d_rlk1 = cp.asarray(a.astype(np.uint32))
+        self._keygen()
 
         print(f"[cuFHE] Ready — N={N}, Q={Q}, T={T}, Δ={DELTA}")
         print(f"[cuFHE] Noise budget ~{Q//(2*DELTA)-1} muls | "
               f"psi={PSI}, omega={OMEGA}, inv_N={INV_N}")
+
+    def _keygen(self):
+        """Generate BFV keypair and relin key; keep secret key local."""
+        self.sk = np.random.randint(0, 2, N, dtype=np.uint32)
+        sk64 = self.sk.astype(np.uint64)
+
+        a = np.random.randint(0, Q, N, dtype=np.uint64)
+        e = np.random.randint(0, 3, N, dtype=np.uint64)
+        pk0 = (Q - (a * sk64 % Q) + e) % Q
+        pk1 = a % Q
+        self.pk = (pk0.astype(np.uint32), pk1.astype(np.uint32))
+        self.d_pk0 = cp.asarray(self.pk[0])
+        self.d_pk1 = cp.asarray(self.pk[1])
+
+        a2 = np.random.randint(0, Q, N, dtype=np.uint64)
+        e2 = np.random.randint(0, 3, N, dtype=np.uint64)
+        sk2 = sk64 * sk64 % Q
+        rlk0 = (sk2 - a2 * sk64 % Q + e2 + 2 * Q) % Q
+        self.d_rlk0 = cp.asarray(rlk0.astype(np.uint32))
+        self.d_rlk1 = cp.asarray(a2.astype(np.uint32))
+
+    def export_public_key(self):
+        return self.pk[0].copy(), self.pk[1].copy()
 
     # PTX compilation handled by gpu_utils.get_ptx()
 
@@ -153,22 +166,33 @@ class cuFHE:
         print(f"[cuFHE] NTT verify: [3]*[2]={c[:5]} {'✓' if ok else '✗ BROKEN'}")
         return ok
 
-    def encrypt(self, message: np.ndarray) -> tuple:
+    def encrypt(self, message: np.ndarray, pk=None) -> tuple:
         assert message.max() < T, f"Values must be < {T}"
         msg = cp.asarray(message.astype(np.uint32))
-        err = cp.zeros(N, dtype=np.uint32)  # zero error for testing
+
+        if pk is None:
+            d_pk0, d_pk1 = self.d_pk0, self.d_pk1
+        else:
+            d_pk0 = cp.asarray(pk[0].astype(np.uint32))
+            d_pk1 = cp.asarray(pk[1].astype(np.uint32))
+
+        u = cp.asarray(np.random.randint(0, 2, N, dtype=np.uint32))
+        e1 = cp.asarray(np.random.randint(0, 3, N, dtype=np.uint32))
+        e2 = cp.asarray(np.random.randint(0, 3, N, dtype=np.uint32))
         ct0 = cp.zeros(N, dtype=cp.uint32)
         ct1 = cp.zeros(N, dtype=cp.uint32)
         t0  = time.perf_counter()
-        self._enc(_grid(N),(BLOCK,),(msg,err,ct0,ct1,np.int32(N)))
+        self._enc_pk(_grid(N), (BLOCK,),
+                     (msg, d_pk0, d_pk1, u, e1, e2, ct0, ct1, np.int32(N)))
         cp.cuda.Stream.null.synchronize()
-        print(f"[cuFHE] Encrypt {(time.perf_counter()-t0)*1e3:.3f}ms")
+        print(f"[cuFHE] Encrypt (pk) {(time.perf_counter()-t0)*1e3:.3f}ms")
         return ct0, ct1
 
     def decrypt(self, ct0, ct1) -> np.ndarray:
         out = cp.zeros(N, dtype=cp.uint32)
         t0  = time.perf_counter()
-        self._dec(_grid(N),(BLOCK,),(ct0,out,np.int32(N)))
+        d_sk = cp.asarray(self.sk)
+        self._dec(_grid(N), (BLOCK,), (ct0, ct1, d_sk, out, np.int32(N)))
         cp.cuda.Stream.null.synchronize()
         print(f"[cuFHE] Decrypt {(time.perf_counter()-t0)*1e3:.3f}ms")
         return cp.asnumpy(out)
@@ -231,7 +255,7 @@ class cuFHE:
         t0  = time.perf_counter()
         # Decrypt current ciphertext to recover plaintext
         tmp = cp.zeros(N, dtype=cp.uint32)
-        self._dec(_grid(N),(BLOCK,),(ct[0],tmp,np.int32(N)))
+        self._dec(_grid(N), (BLOCK,), (ct[0], ct[1], cp.asarray(self.sk), tmp, np.int32(N)))
         cp.cuda.Stream.null.synchronize()
         plaintext = cp.asnumpy(tmp)
         # Re-encrypt with fresh noise — resets noise budget to maximum

@@ -39,10 +39,39 @@ __global__ void bfv_encrypt(const uint32_t* msg, const uint32_t* err,
     ct1[i] = 0;
 }
 
-__global__ void bfv_decrypt(const uint32_t* ct0, uint32_t* msg, int n) {
+extern "C" __global__ void bfv_encrypt_pk(const uint32_t* msg,
+                                            const uint32_t* pk0,
+                                            const uint32_t* pk1,
+                                            const uint32_t* u,
+                                            const uint32_t* e1,
+                                            const uint32_t* e2,
+                                            uint32_t* ct0,
+                                            uint32_t* ct1,
+                                            int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    uint64_t v = (uint64_t)ct0[i] * T + Q / 2;
+
+    // Simplified coefficient-wise BFV demo encryption under public key:
+    // ct0 = pk0*u + e1 + msg*DELTA
+    // ct1 = pk1*u + e2
+    uint64_t t0 = (uint64_t)pk0[i] * u[i] % Q;
+    uint64_t t1 = (uint64_t)pk1[i] * u[i] % Q;
+
+    ct0[i] = (uint32_t)((t0 + e1[i] + (uint64_t)msg[i] * DELTA) % Q);
+    ct1[i] = (uint32_t)((t1 + e2[i]) % Q);
+}
+
+extern "C" __global__ void bfv_decrypt(const uint32_t* ct0,
+                                        const uint32_t* ct1,
+                                        const uint32_t* sk,
+                                        uint32_t* msg,
+                                        int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    // m ~= round((ct0 + ct1*sk) / DELTA) mod T
+    uint64_t phase = (ct0[i] + (uint64_t)ct1[i] * sk[i]) % Q;
+    uint64_t v = phase * T + Q / 2;
     msg[i] = (uint32_t)((v / Q) % T);
 }
 

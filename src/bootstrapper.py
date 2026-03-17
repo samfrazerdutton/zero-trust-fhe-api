@@ -68,7 +68,7 @@ class Bootstrapper:
         print("\n[Bootstrap] === bootstrapping ===")
         t0  = time.perf_counter()
         out = cp.zeros(N, dtype=cp.uint32)
-        self.fhe._dec(_grid(N), (BLOCK,), (ct[0], out, np.int32(N)))
+        self.fhe._dec(_grid(N), (BLOCK,), (ct[0], ct[1], cp.asarray(self.fhe.sk), out, np.int32(N)))
         cp.cuda.Stream.null.synchronize()
         msg   = cp.asnumpy(out)
         fresh = self.fhe.encrypt(msg)
