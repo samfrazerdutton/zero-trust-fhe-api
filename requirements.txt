@@ -1,6 +1,6 @@
-fastapi==0.103.1
-uvicorn==0.23.2
-pydantic==2.3.0
-requests==2.31.0
-numpy>=1.24.0
-cupy-cuda12x
+fastapi
+uvicorn
+pydantic
+requests
+numpy
+cupy-cuda11x
