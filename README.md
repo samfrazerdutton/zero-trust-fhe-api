@@ -1,35 +1,120 @@
-# Zero-Trust FHE Inference API
+# zero-trust-fhe-api
 
-A GPU-accelerated Fully Homomorphic Encryption (FHE) inference node capable of executing unbounded-depth neural networks on encrypted edge-sensor telemetry. 
+A GPU-accelerated Fully Homomorphic Encryption (FHE) inference API. An edge client encrypts telemetry locally, transmits the ciphertext to the server, and the server computes on it without ever seeing the plaintext. The client decrypts the result.
 
-## Performance Benchmarks
-* **Inference Compute Time:** 47.49ms (GPU-side)
-* **Bootstrapping Latency:** 13.89ms (Bare-metal CUDA)
-* **Total Round-Trip Latency:** 58ms (End-to-end HTTP request)
+Built on a custom BFV implementation with bare-metal CUDA kernels for the NTT polynomial arithmetic.
 
-## Architecture Overview
-Fully Homomorphic Encryption (specifically the BFV scheme) allows for compute on encrypted data, but is traditionally bottlenecked by exponential cryptographic noise growth and massive CPU latency during the "bootstrapping" (noise reset) phase.
+---
 
-This repository solves both bottlenecks by shifting the entire cryptographic pipeline to bare-metal GPU compute:
-1. **Self-Healing Forward Pass:** The API receives encrypted telemetry and executes deep non-linear layers. It dynamically monitors the Ring-LWE noise budget of the ciphertext mid-computation.
-2. **Sub-Millisecond Bootstrapper:** When the noise budget hits a critical threshold (<2 bits), the API automatically pauses inference and routes the ciphertext through a custom `CuPy`/`CUDA` bootstrapper.
-3. **Optimized Scaling:** By utilizing RNS basis conversions and custom PTX kernels, this architecture achieves real-time inference speeds on consumer-grade hardware.
+## How it works
 
-## Core Tech Stack
-* **Cryptography Engine:** Custom BFV Implementation (RNS variants)
-* **Hardware Acceleration:** `CuPy` / Custom `CUDA` PTX Kernels
-* **API Layer:** `FastAPI` / `Uvicorn`
+BFV (Brakerski/Fan-Vercauteren) is a scheme that allows arithmetic on ciphertexts directly. The core operation is polynomial multiplication in the negacyclic ring `Z_Q[x]/(x^N+1)`, accelerated here via a custom Number Theoretic Transform (NTT) on the GPU.
 
-## Repository Structure
-* `/src`: The unified engine containing the `cuFHE` context, `Bootstrapper`, and RNS basis bridges.
-* `/kernels`: Pre-compiled bare-metal CUDA kernels (SM_60 to SM_90).
-* `api.py`: The FastAPI server that manages the GPU VRAM allocation and secure inference endpoints.
-* `client.py`: The edge-node simulator for generating and transmitting encrypted payloads.
+The pipeline:
+```
+Edge Client                          API Server
+-----------                          ----------
+Generate keypair
+Encrypt telemetry (pk)
+Send ct + public key  ──────────►   Load ciphertext onto GPU
+                                     Compute he_mul_plain / he_add
+                      ◄──────────   Return result ciphertext
+Decrypt result (sk)
+```
 
-## Running the Zero-Trust Node Locally
+The server never holds the secret key. All computation happens on encrypted data.
 
-**1. Start the Command Server**
+---
+
+## Crypto parameters
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Scheme | BFV | |
+| N | 1024 | Polynomial degree |
+| Q | 12289 | NTT-friendly prime: 3·2¹² + 1 |
+| T | 16 | Plaintext modulus |
+| Δ | 768 | Scaling factor: ⌊Q/T⌋ |
+| PSI | 1945 | Primitive 2N-th root of unity mod Q |
+
+---
+
+## Requirements
+
+- NVIDIA GPU (any SM version from 6.0 upward)
+- CUDA toolkit with `nvcc` on PATH
+- Python 3.10+
+```
+pip install -r requirements.txt
+```
+
+`gpu_utils.py` auto-detects the GPU's SM version at runtime and compiles the PTX if a pre-built binary for that architecture isn't present. No manual recompilation needed when moving between machines.
+
+---
+
+## Running
+
+Start the API server:
 ```bash
 uvicorn api:app --host 127.0.0.1 --port 8000
+```
 
-python3 client.py in second terminal if self host testing
+In a second terminal, run the edge client:
+```bash
+python3 client.py
+```
+
+Expected output:
+```
+--- ZERO-TRUST EDGE CLIENT ---
+[GPU] NVIDIA GeForce RTX 2060 with Max-Q Design | SM_75 | 6.0GB VRAM
+[cuFHE] Ready — N=1024, Q=12289, T=16, Δ=768
+Encrypting telemetry under sparse client keys...
+[cuFHE] Encrypt (pk) 2.070ms
+Transmitting encrypted payload + RLK to API...
+[cuFHE] Decrypt 3.037ms
+Decrypted first 8 outputs: [1, 1, 1, 1, 1, 1, 1, 1]
+```
+
+---
+
+## Repository structure
+```
+.
+├── api.py                  # FastAPI server — receives ciphertext, computes, returns result
+├── client.py               # Edge node — encrypts, transmits, decrypts
+├── src/
+│   ├── fhe_bridge.py       # cuFHE class: keygen, encrypt, decrypt, HE operations
+│   └── gpu_utils.py        # Auto-detects SM version, compiles PTX if needed
+├── kernels/
+│   ├── fhe_kernel.cu       # CUDA source: NTT, BFV encrypt/decrypt, poly arithmetic
+│   └── fhe_kernel_sm_*.ptx # Pre-compiled PTX binaries for various architectures
+└── requirements.txt
+```
+
+---
+
+## Performance
+
+Measured on RTX 2060 Max-Q (SM_75, 6GB VRAM):
+
+| Operation | Latency |
+|-----------|---------|
+| Encrypt (pk) | ~2ms |
+| Decrypt | ~2ms |
+| Full client round-trip | ~60ms (includes HTTP) |
+
+---
+
+## NTT implementation note
+
+The NTT uses Algorithm 1 from Longa & Naehrig (2016) for the negacyclic convolution in `Z_Q[x]/(x^N+1)`. Each butterfly stage uses twiddle factors `PSI^bitrev(m+i, log2N)` directly, avoiding a separate pre/post-multiply pass. The roots table is laid out as `roots[m+i] = PSI^bitrev(m+i, log2N)` so the CUDA kernel can index it with a single `roots[m + threadIdx]` lookup per butterfly.
+
+---
+
+## Limitations
+
+- Secret key lives on the client only — the server has no way to decrypt
+- No noise budget tracking — deep computation chains will corrupt results without bootstrapping
+- Single-ciphertext inference only — batching via SIMD slot packing not yet implemented
+- Requires NVIDIA GPU — no CPU fallback
