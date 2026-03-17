@@ -10,28 +10,28 @@ __device__ __forceinline__ uint32_t reduce_q(uint64_t a) {
     return (uint32_t)(a % Q);
 }
 
-__global__ void poly_add(const uint32_t* a, const uint32_t* b,
+extern "C" __global__ void poly_add(const uint32_t* a, const uint32_t* b,
                          uint32_t* c, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     c[i] = (uint32_t)((a[i] + b[i]) % Q);
 }
 
-__global__ void poly_sub(const uint32_t* a, const uint32_t* b,
+extern "C" __global__ void poly_sub(const uint32_t* a, const uint32_t* b,
                          uint32_t* c, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     c[i] = (uint32_t)((a[i] + Q - b[i]) % Q);
 }
 
-__global__ void poly_scalar_mul(const uint32_t* a, uint32_t s,
+extern "C" __global__ void poly_scalar_mul(const uint32_t* a, uint32_t s,
                                 uint32_t* c, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     c[i] = (uint32_t)((uint64_t)a[i] * s % Q);
 }
 
-__global__ void bfv_encrypt(const uint32_t* msg, const uint32_t* err,
+extern "C" __global__ void bfv_encrypt(const uint32_t* msg, const uint32_t* err,
                              uint32_t* ct0, uint32_t* ct1, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -75,7 +75,7 @@ extern "C" __global__ void bfv_decrypt(const uint32_t* ct0,
     msg[i] = (uint32_t)((v / Q) % T);
 }
 
-__global__ void he_add(const uint32_t* a0, const uint32_t* a1,
+extern "C" __global__ void he_add(const uint32_t* a0, const uint32_t* a1,
                        const uint32_t* b0, const uint32_t* b1,
                        uint32_t* c0, uint32_t* c1, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -84,7 +84,7 @@ __global__ void he_add(const uint32_t* a0, const uint32_t* a1,
     c1[i] = (uint32_t)((a1[i] + b1[i]) % Q);
 }
 
-__global__ void he_mul_plain(const uint32_t* ct0, const uint32_t* ct1,
+extern "C" __global__ void he_mul_plain(const uint32_t* ct0, const uint32_t* ct1,
                              uint32_t scalar,
                              uint32_t* out0, uint32_t* out1, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -93,70 +93,75 @@ __global__ void he_mul_plain(const uint32_t* ct0, const uint32_t* ct1,
     out1[i] = (uint32_t)((uint64_t)ct1[i] * scalar % Q);
 }
 
-// Negacyclic NTT forward
-// pre_mult: psi^i twiddle factors (length N)
-// roots:    omega^bitrev(i) twiddle table (length N)
-__global__ void ntt_forward(uint32_t* poly,
-                            const uint32_t* pre_mult,
-                            const uint32_t* roots,
-                            int n, int stage) {
-    int tid    = blockIdx.x * blockDim.x + threadIdx.x;
-    int half   = 1 << stage;
-    int stride = half * 2;
-    int group  = tid / half;
-    int pos    = tid % half;
-    int i = group * stride + pos;
-    int j = i + half;
-    if (j >= n) return;
-    uint32_t w = roots[half + pos];
-    uint64_t u = poly[i];
-    uint64_t v = (uint64_t)poly[j] * w % Q;
-    poly[i] = (uint32_t)((u + v) % Q);
-    poly[j] = (uint32_t)((u + Q - v) % Q);
+
+
+extern "C" __global__ void ntt_forward(uint32_t* poly, const uint32_t* roots, int n) {
+    // Full NTT in one kernel launch using Algorithm 1 (Longa & Naehrig)
+    // Each thread handles one butterfly per stage, synchronised via shared mem
+    // We do it iteratively over log2(n) stages
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int t = n;
+    for (int m = 1; m < n; m <<= 1) {
+        t >>= 1;
+        // Each thread handles one butterfly: figure out which one
+        // Total butterflies this stage = n/2
+        // butterfly index = tid (if tid < n/2)
+        if (tid < n / 2) {
+            int i_in_group = tid % t;
+            int group      = tid / t;
+            int i = group * 2 * t + i_in_group;
+            int j = i + t;
+            uint32_t S = roots[m + (tid / t)];
+            uint64_t u = poly[i];
+            uint64_t v = (uint64_t)poly[j] * S % Q;
+            poly[i] = (uint32_t)((u + v) % Q);
+            poly[j] = (uint32_t)((u + Q - v) % Q);
+        }
+        __syncthreads();
+    }
 }
 
-// Pre-multiply by psi^i before NTT (negacyclic twist)
-__global__ void ntt_premul(uint32_t* poly, const uint32_t* psi_pow, int n) {
+extern "C" __global__ void ntt_inverse(uint32_t* poly, const uint32_t* inv_roots, int n) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int t = 1;
+    int m = n;
+    while (m > 1) {
+        int h = m >> 1;
+        if (tid < n / 2) {
+            int i_in_group = tid % t;
+            int group      = tid / t;
+            int i = group * 2 * t + i_in_group;
+            int j = i + t;
+            uint32_t S = inv_roots[h + (tid / t)];
+            uint64_t u = poly[i];
+            uint64_t v = poly[j];
+            poly[i] = (uint32_t)((u + v) % Q);
+            poly[j] = (uint32_t)((u + Q - v) % Q * S % Q);
+        }
+        __syncthreads();
+        t <<= 1;
+        m >>= 1;
+    }
+}
+
+extern "C" __global__ void ntt_premul(uint32_t* poly, const uint32_t* psi_pow, int n) {
+    return; // no-op: Algorithm 1 absorbs twist into butterfly twiddles
+}
+
+extern "C" __global__ void ntt_postmul(uint32_t* poly, uint32_t inv_n, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    poly[i] = (uint32_t)((uint64_t)poly[i] * psi_pow[i] % Q);
+    poly[i] = (uint32_t)((uint64_t)poly[i] * inv_n % Q);
 }
 
-// Post-multiply by inv_psi^i after INTT (negacyclic untwist)
-__global__ void ntt_postmul(uint32_t* poly, const uint32_t* inv_psi_pow,
-                            uint32_t inv_n, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    uint64_t v = (uint64_t)poly[i] * inv_n % Q;
-    poly[i] = (uint32_t)(v * inv_psi_pow[i] % Q);
-}
-
-__global__ void ntt_inverse(uint32_t* poly,
-                            const uint32_t* inv_roots,
-                            int n, int stage) {
-    int tid    = blockIdx.x * blockDim.x + threadIdx.x;
-    int half   = 1 << stage;
-    int stride = half * 2;
-    int group  = tid / half;
-    int pos    = tid % half;
-    int i = group * stride + pos;
-    int j = i + half;
-    if (j >= n) return;
-    uint32_t w = inv_roots[half + pos];
-    uint64_t u = poly[i];
-    uint64_t v = poly[j];
-    poly[i] = (uint32_t)((u + v) % Q);
-    poly[j] = (uint32_t)((u + Q - v) % Q * w % Q);
-}
-
-__global__ void poly_pointwise_mul(const uint32_t* a, const uint32_t* b,
+extern "C" __global__ void poly_pointwise_mul(const uint32_t* a, const uint32_t* b,
                                    uint32_t* c, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     c[i] = (uint32_t)((uint64_t)a[i] * b[i] % Q);
 }
 
-__global__ void poly_scale(uint32_t* poly, uint32_t inv_n, int n) {
+extern "C" __global__ void poly_scale(uint32_t* poly, uint32_t inv_n, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     poly[i] = (uint32_t)((uint64_t)poly[i] * inv_n % Q);
@@ -167,13 +172,13 @@ __global__ void poly_scale(uint32_t* poly, uint32_t inv_n, int n) {
 // Rescaling: multiply by DELTA_INV to go from DELTA^2*m -> DELTA*m
 #define DELTA_INV 12273ULL
 
-__global__ void bfv_rescale(const uint32_t* input, uint32_t* output, int n) {
+extern "C" __global__ void bfv_rescale(const uint32_t* input, uint32_t* output, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     output[i] = (uint32_t)((uint64_t)input[i] * DELTA_INV % Q);
 }
 
-__global__ void relin_key_mul(const uint32_t* ct2,
+extern "C" __global__ void relin_key_mul(const uint32_t* ct2,
                               const uint32_t* rlk0, const uint32_t* rlk1,
                               uint32_t* out0, uint32_t* out1, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -184,14 +189,14 @@ __global__ void relin_key_mul(const uint32_t* ct2,
 
 #define Q_PRIME 257U
 
-__global__ void modswitch_down(const uint32_t* in, uint32_t* out, int n) {
+extern "C" __global__ void modswitch_down(const uint32_t* in, uint32_t* out, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     uint64_t scaled = (uint64_t)in[i] * Q_PRIME + Q / 2;
     out[i] = (uint32_t)((scaled / Q) % Q_PRIME);
 }
 
-__global__ void modswitch_up(const uint32_t* in, uint32_t* out, int n) {
+extern "C" __global__ void modswitch_up(const uint32_t* in, uint32_t* out, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     out[i] = in[i] % (uint32_t)Q;
@@ -199,7 +204,7 @@ __global__ void modswitch_up(const uint32_t* in, uint32_t* out, int n) {
 // Galois automorphism for ciphertext rotation
 // Applies x -> x^k map to polynomial coefficients
 // For rotation by r: k = 5^r mod 2N (generator of Galois group)
-__global__ void galois_automorphism(const uint32_t* in, uint32_t* out,
+extern "C" __global__ void galois_automorphism(const uint32_t* in, uint32_t* out,
                                      uint32_t k, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;

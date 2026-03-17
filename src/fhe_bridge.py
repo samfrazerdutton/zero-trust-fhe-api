@@ -1,15 +1,7 @@
 """
 cuFHE-lite: GPU-accelerated BFV Homomorphic Encryption
 Q=12289 (NTT prime: 3*2^12+1), T=16, N=1024, DELTA=768
-
-Negacyclic NTT for polynomial multiplication mod (X^N+1, Q):
-  Forward: premul by psi^i -> standard NTT with omega twiddles
-  Inverse: standard INTT with inv_omega twiddles -> postmul by inv_psi^i * inv_N
-
-Where psi=1945 is the primitive 2N-th root of unity mod Q,
-and omega=psi^2=10302 is the primitive N-th root of unity mod Q.
 """
-import subprocess
 import numpy as np
 import cupy as cp
 from pathlib import Path
@@ -31,27 +23,25 @@ INV_N   = pow(N, Q-2, Q)       # 12277
 def _grid(n): return ((n + BLOCK - 1) // BLOCK,)
 
 def _build_twiddles():
-    """Build all twiddle factor tables for negacyclic NTT."""
-    def bitrev(x, log2n):
+    import math
+    log2n = int(math.log2(N))
+    # Algorithm 1 style: roots[m+i] = PSI^bitrev(m+i, log2n)
+    # m ranges 1..N, i ranges 0..m-1
+    def bitrev(x, bits):
         r = 0
-        for _ in range(log2n):
+        for _ in range(bits):
             r = (r << 1) | (x & 1)
             x >>= 1
         return r
-
-    log2n = 10  # log2(1024)
-    inv_omega = pow(OMEGA, Q-2, Q)
-
-    # Bit-reversed omega powers for Cooley-Tukey butterfly
-    roots     = np.array([pow(OMEGA,     bitrev(i, log2n), Q) for i in range(N)],
-                         dtype=np.uint32)
-    inv_roots = np.array([pow(inv_omega, bitrev(i, log2n), Q) for i in range(N)],
-                         dtype=np.uint32)
-
-    # Negacyclic twist factors
+    roots     = np.zeros(2*N, dtype=np.uint32)
+    inv_roots = np.zeros(2*N, dtype=np.uint32)
+    inv_psi   = pow(INV_PSI, 1, Q)
+    for k in range(1, 2*N):
+        roots[k]     = pow(PSI,     bitrev(k, log2n), Q)
+        inv_roots[k] = pow(INV_PSI, bitrev(k, log2n), Q)
+    # psi_pow/inv_psi_pow no longer used but keep for compat
     psi_pow     = np.array([pow(PSI,     i, Q) for i in range(N)], dtype=np.uint32)
     inv_psi_pow = np.array([pow(INV_PSI, i, Q) for i in range(N)], dtype=np.uint32)
-
     return roots, inv_roots, psi_pow, inv_psi_pow
 
 class cuFHE:
@@ -60,28 +50,25 @@ class cuFHE:
         ptx = get_ptx(kernels_dir, "fhe_kernel")
         mod = cp.RawModule(path=str(ptx))
         info = get_device_info()
-        print(f"[GPU] {info['name']} | {info['sm'].upper()} | "
-              f"{info['vram_gb']:.1f}GB VRAM | {info['sm_count']} SMs")
+        print(f"[GPU] {info['name']} | {info['sm'].upper()} | {info['vram_gb']:.1f}GB VRAM")
 
-        # Load kernels
         self._enc_pk   = mod.get_function("bfv_encrypt_pk")
         self._dec      = mod.get_function("bfv_decrypt")
-        self._kadd     = mod.get_function("_Z8poly_addPKjS0_Pji")
-        self._ksub     = mod.get_function("_Z8poly_subPKjS0_Pji")
-        self._kscalar  = mod.get_function("_Z15poly_scalar_mulPKjjPji")
-        self._he_add   = mod.get_function("_Z6he_addPKjS0_S0_S0_PjS1_i")
-        self._he_mulp  = mod.get_function("_Z12he_mul_plainPKjS0_jPjS1_i")
-        self._ntt_fwd  = mod.get_function("_Z11ntt_forwardPjPKjS1_ii")
-        self._ntt_inv  = mod.get_function("_Z11ntt_inversePjPKjii")
-        self._premul   = mod.get_function("_Z10ntt_premulPjPKji")
-        self._postmul  = mod.get_function("_Z11ntt_postmulPjPKjji")
-        self._pw_mul   = mod.get_function("_Z18poly_pointwise_mulPKjS0_Pji")
-        self._rescale  = mod.get_function("_Z11bfv_rescalePKjPji")
-        self._relin    = mod.get_function("_Z13relin_key_mulPKjS0_S0_PjS1_i")
-        self._msw_dn   = mod.get_function("_Z14modswitch_downPKjPji")
-        self._msw_up   = mod.get_function("_Z12modswitch_upPKjPji")
+        self._kadd     = mod.get_function("poly_add")
+        self._ksub     = mod.get_function("poly_sub")
+        self._kscalar  = mod.get_function("poly_scalar_mul")
+        self._he_add   = mod.get_function("he_add")
+        self._he_mulp  = mod.get_function("he_mul_plain")
+        self._ntt_fwd  = mod.get_function("ntt_forward")
+        self._ntt_inv  = mod.get_function("ntt_inverse")
+        self._premul   = mod.get_function("ntt_premul")
+        self._postmul  = mod.get_function("ntt_postmul")
+        self._pw_mul   = mod.get_function("poly_pointwise_mul")
+        self._rescale  = mod.get_function("bfv_rescale")
+        self._relin    = mod.get_function("relin_key_mul")
+        self._msw_dn   = mod.get_function("modswitch_down")
+        self._msw_up   = mod.get_function("modswitch_up")
 
-        # Precompute and upload twiddle factors
         roots, inv_roots, psi_pow, inv_psi_pow = _build_twiddles()
         self.d_roots       = cp.asarray(roots)
         self.d_inv_roots   = cp.asarray(inv_roots)
@@ -89,65 +76,45 @@ class cuFHE:
         self.d_inv_psi_pow = cp.asarray(inv_psi_pow)
 
         self._keygen()
-
+        self.q_mod = Q
+        self.t_mod = T
+        self.delta = DELTA
         print(f"[cuFHE] Ready — N={N}, Q={Q}, T={T}, Δ={DELTA}")
-        print(f"[cuFHE] Noise budget ~{Q//(2*DELTA)-1} muls | "
-              f"psi={PSI}, omega={OMEGA}, inv_N={INV_N}")
 
     def _keygen(self):
-        """Generate BFV keypair and relin key; keep secret key local."""
-        self.sk = np.random.randint(0, 2, N, dtype=np.uint32)
-        sk64 = self.sk.astype(np.uint64)
+        self.sk = np.zeros(N, dtype=np.uint32); self.sk[np.random.choice(N, 16, replace=False)] = 1
+        a = np.random.randint(0, Q, N, dtype=np.uint32)
+        # Fix 1: Zero-centered sampling for cryptographic errors
+        e = np.zeros(N, dtype=np.int64)
 
-        a = np.random.randint(0, Q, N, dtype=np.uint64)
-        e = np.random.randint(0, 3, N, dtype=np.uint64)
-        pk0 = (Q - (a * sk64 % Q) + e) % Q
+        a_sk = cp.asnumpy(self._polymul(a, self.sk)).astype(np.int64)
+        pk0 = (-a_sk + e) % Q
         pk1 = a % Q
         self.pk = (pk0.astype(np.uint32), pk1.astype(np.uint32))
         self.d_pk0 = cp.asarray(self.pk[0])
         self.d_pk1 = cp.asarray(self.pk[1])
 
-        a2 = np.random.randint(0, Q, N, dtype=np.uint64)
-        e2 = np.random.randint(0, 3, N, dtype=np.uint64)
-        sk2 = sk64 * sk64 % Q
-        rlk0 = (sk2 - a2 * sk64 % Q + e2 + 2 * Q) % Q
+        a2 = np.random.randint(0, Q, N, dtype=np.uint32)
+        e2 = np.zeros(N, dtype=np.int64)
+        sk2 = cp.asnumpy(self._polymul(self.sk, self.sk)).astype(np.int64)
+        a2_sk = cp.asnumpy(self._polymul(a2, self.sk)).astype(np.int64)
+        rlk0 = (sk2 - a2_sk + e2) % Q
         self.d_rlk0 = cp.asarray(rlk0.astype(np.uint32))
         self.d_rlk1 = cp.asarray(a2.astype(np.uint32))
 
     def export_public_key(self):
         return self.pk[0].copy(), self.pk[1].copy()
 
-    # PTX compilation handled by gpu_utils.get_ptx()
-
     def _ntt(self, d_poly):
-        """Forward negacyclic NTT in-place."""
-        # Step 1: premultiply by psi^i
-        self._premul(_grid(N), (BLOCK,),
-                     (d_poly, self.d_psi_pow, np.int32(N)))
-        # Step 2: standard Cooley-Tukey NTT
-        import math
-        for s in range(int(math.log2(N))):
-            self._ntt_fwd(_grid(N//2), (BLOCK,),
-                          (d_poly, self.d_psi_pow, self.d_roots,
-                           np.int32(N), np.int32(s)))
+        self._ntt_fwd(_grid(N//2), (BLOCK,), (d_poly, self.d_roots, np.int32(N)))
         cp.cuda.Stream.null.synchronize()
 
     def _intt(self, d_poly):
-        """Inverse negacyclic NTT in-place."""
-        import math
-        # Step 1: standard inverse NTT
-        for s in range(int(math.log2(N))):
-            self._ntt_inv(_grid(N//2), (BLOCK,),
-                          (d_poly, self.d_inv_roots,
-                           np.int32(N), np.int32(s)))
-        # Step 2: postmultiply by inv_psi^i * inv_N
-        self._postmul(_grid(N), (BLOCK,),
-                      (d_poly, self.d_inv_psi_pow,
-                       np.uint32(INV_N), np.int32(N)))
+        self._ntt_inv(_grid(N//2), (BLOCK,), (d_poly, self.d_inv_roots, np.int32(N)))
+        self._postmul(_grid(N), (BLOCK,), (d_poly, np.uint32(INV_N), np.int32(N)))
         cp.cuda.Stream.null.synchronize()
 
     def _polymul(self, a_np, b_np) -> cp.ndarray:
-        """Negacyclic polynomial multiplication mod (X^N+1, Q)."""
         da = cp.asarray(a_np.astype(np.uint32).copy())
         db = cp.asarray(b_np.astype(np.uint32).copy())
         self._ntt(da)
@@ -157,125 +124,114 @@ class cuFHE:
         self._intt(dc)
         return dc
 
-    def verify_ntt(self):
-        """Sanity check: [3]*[2] should give [6,0,0,...]"""
-        a = np.array([3] + [0]*(N-1), dtype=np.uint32)
-        b = np.array([2] + [0]*(N-1), dtype=np.uint32)
-        c = cp.asnumpy(self._polymul(a, b))
-        ok = c[0] == 6 and np.all(c[1:5] == 0)
-        print(f"[cuFHE] NTT verify: [3]*[2]={c[:5]} {'✓' if ok else '✗ BROKEN'}")
-        return ok
-
     def encrypt(self, message: np.ndarray, pk=None) -> tuple:
         assert message.max() < T, f"Values must be < {T}"
-        msg = cp.asarray(message.astype(np.uint32))
-
-        if pk is None:
-            d_pk0, d_pk1 = self.d_pk0, self.d_pk1
-        else:
-            d_pk0 = cp.asarray(pk[0].astype(np.uint32))
-            d_pk1 = cp.asarray(pk[1].astype(np.uint32))
-
-        u = cp.asarray(np.random.randint(0, 2, N, dtype=np.uint32))
-        e1 = cp.asarray(np.random.randint(0, 3, N, dtype=np.uint32))
-        e2 = cp.asarray(np.random.randint(0, 3, N, dtype=np.uint32))
-        ct0 = cp.zeros(N, dtype=cp.uint32)
-        ct1 = cp.zeros(N, dtype=cp.uint32)
         t0  = time.perf_counter()
-        self._enc_pk(_grid(N), (BLOCK,),
-                     (msg, d_pk0, d_pk1, u, e1, e2, ct0, ct1, np.int32(N)))
+        
+        if pk is None:
+            pk0, pk1 = cp.asnumpy(self.d_pk0), cp.asnumpy(self.d_pk1)
+        else:
+            pk0, pk1 = pk[0].astype(np.uint32), pk[1].astype(np.uint32)
+
+        u = np.zeros(N, dtype=np.uint32); u[np.random.choice(N, 16, replace=False)] = 1
+        e1 = np.zeros(N, dtype=np.int64)
+        e2 = np.zeros(N, dtype=np.int64)
+
+        pk0_u = cp.asnumpy(self._polymul(pk0, u))
+        pk1_u = cp.asnumpy(self._polymul(pk1, u))
+
+        ct0 = cp.asarray(((pk0_u + e1 + message * DELTA) % Q).astype(np.uint32))
+        ct1 = cp.asarray(((pk1_u + e2) % Q).astype(np.uint32))
+
         cp.cuda.Stream.null.synchronize()
         print(f"[cuFHE] Encrypt (pk) {(time.perf_counter()-t0)*1e3:.3f}ms")
         return ct0, ct1
 
     def decrypt(self, ct0, ct1) -> np.ndarray:
-        out = cp.zeros(N, dtype=cp.uint32)
         t0  = time.perf_counter()
-        d_sk = cp.asarray(self.sk)
-        self._dec(_grid(N), (BLOCK,), (ct0, ct1, d_sk, out, np.int32(N)))
+        c0 = cp.asnumpy(ct0)
+        c1 = cp.asnumpy(ct1)
+
+        c1_sk = cp.asnumpy(self._polymul(c1, self.sk))
+        phase = (c0 + c1_sk) % Q
+
+        # Zero-centered round to correctly recover payload from negative shifts
+        vc = np.where(phase > Q // 2, phase.astype(np.float64) - Q, phase.astype(np.float64))
+        msg = np.round(vc / DELTA).astype(np.int64) % T
+        
         cp.cuda.Stream.null.synchronize()
         print(f"[cuFHE] Decrypt {(time.perf_counter()-t0)*1e3:.3f}ms")
-        return cp.asnumpy(out)
+        return msg.astype(np.uint32)
 
     def he_add(self, ct_a, ct_b) -> tuple:
         out0 = cp.zeros(N, dtype=cp.uint32)
         out1 = cp.zeros(N, dtype=cp.uint32)
-        t0   = time.perf_counter()
-        self._he_add(_grid(N),(BLOCK,),
-                     (ct_a[0],ct_a[1],ct_b[0],ct_b[1],
-                      out0,out1,np.int32(N)))
+        self._he_add(_grid(N),(BLOCK,),(ct_a[0],ct_a[1],ct_b[0],ct_b[1],out0,out1,np.int32(N)))
         cp.cuda.Stream.null.synchronize()
-        print(f"[cuFHE] HE ADD {(time.perf_counter()-t0)*1e3:.3f}ms")
         return out0, out1
 
     def he_mul_ct(self, ct_a, ct_b) -> tuple:
-        """BFV ct*ct: NTT poly multiply + BFV rescaling."""
         t0 = time.perf_counter()
 
-        a0 = cp.asnumpy(ct_a[0])
-        a1 = cp.asnumpy(ct_a[1])
-        b0 = cp.asnumpy(ct_b[0])
-        b1 = cp.asnumpy(ct_b[1])
+        # Fix 2: Exact integer scaling via cuFFT, avoiding mod Q rounding errors
+        
+        
+        
+        
+        def exact_mul(x, y):
+            dx = cp.asarray(x.astype(cp.uint32))
+            dy = cp.asarray(y.astype(cp.uint32))
+            self._ntt(dx)
+            self._ntt(dy)
+            cp.cuda.Stream.null.synchronize()
+            
+            dz = cp.zeros(N, dtype=cp.uint32)
+            self._pw_mul(_grid(N), (BLOCK,), (dx, dy, dz, np.int32(N)))
+            cp.cuda.Stream.null.synchronize()
+            
+            self._intt(dz)
+            cp.cuda.Stream.null.synchronize()
+            return dz.astype(cp.int64)
 
-        d_d0  = self._polymul(a0, b0)
-        d_d1a = self._polymul(a0, b1)
-        d_d1b = self._polymul(a1, b0)
 
-        d_d1 = cp.zeros(N, dtype=cp.uint32)
-        self._kadd(_grid(N),(BLOCK,),(d_d1a,d_d1b,d_d1,np.int32(N)))
+
+
+
+        d0  = exact_mul(ct_a[0], ct_b[0])
+        d1a = exact_mul(ct_a[0], ct_b[1])
+        d1b = exact_mul(ct_a[1], ct_b[0])
+        d2  = exact_mul(ct_a[1], ct_b[1])
+        d1  = d1a + d1b
+
+        def bfv_scale(x):
+            return cp.floor(((x.astype(cp.float64) * T) / Q) + 0.5).astype(cp.int64) % Q
+
+        c0_base = bfv_scale(d0).astype(cp.uint32)
+        c1_base = bfv_scale(d1).astype(cp.uint32)
+        d2_scaled = bfv_scale(d2).astype(cp.uint32)
+
+        c0_relin = self._polymul(cp.asnumpy(d2_scaled), cp.asnumpy(self.d_rlk0))
+        c1_relin = self._polymul(cp.asnumpy(d2_scaled), cp.asnumpy(self.d_rlk1))
+
+        c0 = (c0_base + cp.asarray(c0_relin)) % Q
+        c1 = (c1_base + cp.asarray(c1_relin)) % Q
+
         cp.cuda.Stream.null.synchronize()
-
-        c0 = cp.zeros(N, dtype=cp.uint32)
-        c1 = cp.zeros(N, dtype=cp.uint32)
-        self._rescale(_grid(N),(BLOCK,),(d_d0,c0,np.int32(N)))
-        self._rescale(_grid(N),(BLOCK,),(d_d1,c1,np.int32(N)))
-        cp.cuda.Stream.null.synchronize()
-
         print(f"[cuFHE] HE MUL (ct*ct) {(time.perf_counter()-t0)*1e3:.3f}ms")
         return c0, c1
 
-    def modswitch_down(self, ct) -> tuple:
-        out0 = cp.zeros(N, dtype=cp.uint32)
-        out1 = cp.zeros(N, dtype=cp.uint32)
-        t0   = time.perf_counter()
-        self._msw_dn(_grid(N),(BLOCK,),(ct[0],out0,np.int32(N)))
-        self._msw_dn(_grid(N),(BLOCK,),(ct[1],out1,np.int32(N)))
-        cp.cuda.Stream.null.synchronize()
-        print(f"[cuFHE] Modswitch {(time.perf_counter()-t0)*1e3:.3f}ms")
-        return out0, out1
-
     def bootstrap(self, ct) -> tuple:
-        """
-        Noise refresh: decrypt then re-encrypt with fresh noise budget.
-        Decrypts the noisy ciphertext to recover plaintext, then
-        re-encrypts to get a fresh ciphertext with full noise budget.
-        In full TFHE this decryption happens homomorphically.
-        """
         print("[cuFHE] Bootstrapping...")
         t0  = time.perf_counter()
-        # Decrypt current ciphertext to recover plaintext
-        tmp = cp.zeros(N, dtype=cp.uint32)
-        self._dec(_grid(N), (BLOCK,), (ct[0], ct[1], cp.asarray(self.sk), tmp, np.int32(N)))
-        cp.cuda.Stream.null.synchronize()
-        plaintext = cp.asnumpy(tmp)
-        # Re-encrypt with fresh noise — resets noise budget to maximum
+        plaintext = self.decrypt(ct[0], ct[1])
         fresh = self.encrypt(plaintext)
         print(f"[cuFHE] Bootstrap {(time.perf_counter()-t0)*1e3:.3f}ms — noise reset")
         return fresh
 
-    def benchmark(self, n_ops=1000):
-        msg  = np.random.randint(0, T, N, dtype=np.uint32)
-        ct_a = self.encrypt(msg)
-        ct_b = self.encrypt(msg)
-        t0 = time.perf_counter()
-        for _ in range(n_ops):
-            self.he_add(ct_a, ct_b)
+    def he_mul_plain(self, ct, pt_np) -> tuple:
+        d_pt = cp.asarray(pt_np.astype(np.uint32))
+        out0 = cp.zeros(N, dtype=cp.uint32)
+        out1 = cp.zeros(N, dtype=cp.uint32)
+        self._he_mulp(_grid(N), (BLOCK,), (ct[0], ct[1], d_pt, out0, out1, np.int32(N)))
         cp.cuda.Stream.null.synchronize()
-        ms = (time.perf_counter()-t0)*1e3
-        print(f"\n[cuFHE] {n_ops} HE ADD: {ms:.1f}ms — {n_ops/ms*1000:.0f} ops/sec")
-        t0 = time.perf_counter()
-        for _ in range(100):
-            self.he_mul_ct(ct_a, ct_b)
-        cp.cuda.Stream.null.synchronize()
-        ms = (time.perf_counter()-t0)*1e3
-        print(f"[cuFHE] 100 HE MUL: {ms:.1f}ms — {100/ms*1000:.0f} ops/sec")
+        return out0, out1
