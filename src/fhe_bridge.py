@@ -10,7 +10,7 @@ from gpu_utils import get_ptx, get_device_info
 
 Q       = 12289
 Q_PRIME = 257
-T       = 16
+T       = 12289
 N       = 1024
 DELTA   = Q // T   # 768
 BLOCK   = 256

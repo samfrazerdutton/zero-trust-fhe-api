@@ -1,45 +1,52 @@
 import requests
 import numpy as np
-import sys
-import os
-
+import sys, os
+import time
 sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
-from fhe_bridge import cuFHE, N
+from rns_bridge import RNSContext
+from batch_encoder import BatchEncoder
 
-print("\n--- ZERO-TRUST EDGE CLIENT ---")
-fhe = cuFHE()
+def print_dashboard(data, display_count=15):
+    print("\n" + "="*55)
+    print(" 🛡️  ZERO-TRUST EDGE: LIVE THREAT FEATURES  🛡️ ")
+    print("="*55 + "\n")
+    
+    max_val = max(data[:display_count]) if max(data[:display_count]) > 0 else 1
+    
+    for i, val in enumerate(data[:display_count]):
+        bar_len = int((val / max_val) * 35)
+        # ANSI color codes: Cyan for the bar
+        bar = "\033[96m" + "█" * bar_len + "\033[0m"
+        print(f" Sensor_CH_{i:03d} | Output: {val:05d} | {bar}")
+        time.sleep(0.08)  # Cascading effect for the presentation
+        
+    print(f"\n[✓] {len(data)}-Slot SIMD Array Successfully Decrypted.\n")
 
-# Generate a simple payload: [1, 1, 1, 1...]
-# 1 * 1 should equal 1
-msg = np.zeros(N, dtype=np.uint32)
-msg[0:8] = 1
+print("\n--- ZERO-TRUST EDGE: CLIENT ---")
+rns = RNSContext()
+encoder = BatchEncoder(N=1024, T=65537)
 
-print("Encrypting telemetry under sparse client keys...")
-ct0, ct1 = fhe.encrypt(msg)
+sensor_data = np.arange(1024, dtype=np.uint32)
+pt_poly = encoder.encode(sensor_data)
+ct0, ct1 = rns.encrypt(pt_poly)
 
-pk0, pk1 = fhe.export_public_key()
-rlk0 = fhe.d_rlk0.get().tolist()
-rlk1 = fhe.d_rlk1.get().tolist()
-
-payload = {
+print("Transmitting encrypted SIMD array to Inference API...")
+t0 = time.perf_counter()
+response = requests.post("http://127.0.0.1:8000/predict/features", json={
     "ct0": ct0.get().tolist(),
-    "ct1": ct1.get().tolist(),
-    "pk0": pk0.tolist(),
-    "pk1": pk1.tolist(),
-    "rlk0": rlk0,
-    "rlk1": rlk1
-}
-
-print("Transmitting encrypted payload + RLK to API...")
-url = "http://127.0.0.1:8000/predict/encrypted"
-response = requests.post(url, json=payload)
+    "ct1": ct1.get().tolist()
+})
+network_time = (time.perf_counter() - t0) * 1000
 
 if response.status_code == 200:
     res_data = response.json()
-    res_ct0 = np.array(res_data["ct0"], dtype=np.uint32)
-    res_ct1 = np.array(res_data["ct1"], dtype=np.uint32)
+    res_c0 = np.array(res_data["ct0"], dtype=np.uint32)
+    res_c1 = np.array(res_data["ct1"], dtype=np.uint32)
     
-    decrypted = fhe.decrypt(res_ct0, res_ct1)
-    print(f"\nDecrypted first 8 outputs: {decrypted[0:8].tolist()}")
+    dec_poly = rns.decrypt(res_c0, res_c1)
+    final_features = encoder.decode(dec_poly)
+    
+    print(f"\n[Network Round-Trip + GPU Inference]: {network_time:.2f}ms")
+    print_dashboard(final_features)
 else:
     print(f"Error: {response.text}")

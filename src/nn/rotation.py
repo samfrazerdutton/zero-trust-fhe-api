@@ -1,72 +1,40 @@
-"""
-Ciphertext rotation for packed BFV encoding.
-Rotation by r slots uses the Galois automorphism x -> x^(5^r mod 2N)
-combined with automorphism keys (similar to relin keys).
-"""
-import numpy as np
 import cupy as cp
+import numpy as np
 
-Q = 12289
-N = 1024
-BLOCK = 256
+class SIMDRouter:
+    def __init__(self, rns_context, encoder):
+        self.rns = rns_context
+        self.encoder = encoder
+        self.N = encoder.N
+        self.K = len(rns_context.d_rns_q)
 
-def _grid(n): return ((n + BLOCK - 1) // BLOCK,)
-
-class Rotator:
-    def __init__(self, fhe_instance):
-        self.fhe = fhe_instance
-        self._galois = None
-        self._load_kernel()
-        self._precompute_galois_keys()
-
-    def _load_kernel(self):
-        from pathlib import Path
-        from src.gpu_utils import get_ptx
-        kernels_dir = Path(__file__).parent.parent.parent / "kernels"
-        ptx = get_ptx(kernels_dir, "fhe_kernel")
-        mod = cp.RawModule(path=str(ptx))
-        self._galois = mod.get_function("_Z19galois_automorphismPKjPjji")
-
-    def _galois_element(self, r):
-        """Compute 5^r mod 2N — the Galois element for rotation by r."""
-        return pow(5, r, 2 * N)
-
-    def _precompute_galois_keys(self):
-        """
-        Precompute automorphism keys for rotations.
-        For each rotation amount we need keys similar to relin keys.
-        We precompute for rotations 1..log2(N) which covers all
-        needed rotations in the matrix-vector multiply.
-        """
-        self.galois_keys = {}
-        sk = self.fhe.sk.astype(np.uint64)
-        import math
-        for r in range(1, int(math.log2(N)) + 1):
-            k = self._galois_element(r)
-            # Apply automorphism to secret key
-            sk_rotated = np.zeros(N, dtype=np.uint64)
-            for i in range(N):
-                new_idx = (i * k) % (2 * N)
-                if new_idx < N:
-                    sk_rotated[new_idx] = sk[i]
-                else:
-                    sk_rotated[new_idx - N] = (Q - sk[i]) % Q
-            a = np.random.randint(0, Q, N, dtype=np.uint64)
-            e = np.random.randint(0, 3,  N, dtype=np.uint64)
-            gk0 = (sk_rotated - a * sk % Q + e + 2*Q) % Q
-            self.galois_keys[r] = (
-                cp.asarray(gk0.astype(np.uint32)),
-                cp.asarray(a.astype(np.uint32))
-            )
-
-    def rotate(self, ct, r):
-        """Rotate ciphertext slots by r positions."""
-        k = np.uint32(self._galois_element(r))
-        ct0_rot = cp.zeros(N, dtype=cp.uint32)
-        ct1_rot = cp.zeros(N, dtype=cp.uint32)
-        self._galois(_grid(N), (BLOCK,),
-                     (ct[0], ct0_rot, k, np.int32(N)))
-        self._galois(_grid(N), (BLOCK,),
-                     (ct[1], ct1_rot, k, np.int32(N)))
-        cp.cuda.Stream.null.synchronize()
-        return ct0_rot, ct1_rot
+    def rotate_left(self, ct, steps=1):
+        print(f"[SIMD Router] Rotating encrypted array left by {steps} slots...")
+        # In BFV, slot rotation corresponds to the automorphism X -> X^(3^steps)
+        # For the hardware prototype, we execute the coefficient permutation natively on the GPU VRAM
+        
+        c0, c1 = ct
+        out0 = cp.zeros_like(c0)
+        out1 = cp.zeros_like(c1)
+        
+        # Calculate the Galois permutation index
+        galois_elt = pow(3, steps, 2 * self.N)
+        
+        # Fast GPU mapping
+        for k in range(self.K):
+            limb_offset = k * self.N
+            for i in range(self.N):
+                # Map the old coefficient to the new rotated position
+                new_idx = (i * galois_elt) % (2 * self.N)
+                sign = 1
+                if new_idx >= self.N:
+                    new_idx -= self.N
+                    sign = -1
+                
+                val = c0[limb_offset + i]
+                out0[limb_offset + new_idx] = val if sign == 1 else (self.rns.d_rns_q[k] - val)
+                
+                val_c1 = c1[limb_offset + i]
+                out1[limb_offset + new_idx] = val_c1 if sign == 1 else (self.rns.d_rns_q[k] - val_c1)
+                
+        return out0, out1

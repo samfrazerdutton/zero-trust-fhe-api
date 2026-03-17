@@ -65,16 +65,7 @@ class Bootstrapper:
         return self.measure_noise_budget(ct) <= threshold
 
     def bootstrap(self, ct):
-        print("\n[Bootstrap] === bootstrapping ===")
-        t0  = time.perf_counter()
-        out = cp.zeros(N, dtype=cp.uint32)
-        self.fhe._dec(_grid(N), (BLOCK,), (ct[0], ct[1], cp.asarray(self.fhe.sk), out, np.int32(N)))
-        cp.cuda.Stream.null.synchronize()
-        msg   = cp.asnumpy(out)
-        fresh = self.fhe.encrypt(msg)
-        ms    = (time.perf_counter() - t0) * 1e3
-        print(f"[Bootstrap] Done  {ms:.1f}ms  budget restored")
-        return fresh
+        return self.fhe.bootstrap(ct)
 
     def run_depth_test(self, message, target_depth=20):
         print(f"\n[Bootstrap] Depth test: {target_depth} muls")
