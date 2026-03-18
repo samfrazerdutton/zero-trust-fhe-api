@@ -2,7 +2,7 @@
 
 A hardware-accelerated, Fully Homomorphic Encryption (FHE) inference pipeline designed for edge computing. This engine allows a client to transmit encrypted sensor telemetry to an API, where a GPU performs machine learning feature extraction on the ciphertexts *without ever decrypting the payload*. 
 
-This project was developed as a final-year IT capstone at the University of North Texas (UNT), demonstrating a lightweight, high-performance alternative to massive standard FHE libraries.
+This project was developed as demonstrating a lightweight, high-performance alternative to massive standard FHE libraries.
 
 ## 🚀 Key Capabilities
 * **True SIMD Processing:** Uses Chinese Remainder Theorem (CRT) batching to pack 1,024 discrete sensor readings into a single polynomial.
@@ -30,7 +30,7 @@ This prototype is aggressively optimized for NVIDIA hardware. It has been succes
 
 1. **Clone the repository:**
    ```bash
-   git clone [https://github.com/yourusername/zero-trust-fhe-api.git](https://github.com/yourusername/zero-trust-fhe-api.git)
+   git clone [https://github.com/samfrazerdutton/zero-trust-fhe-api.git](https://github.com/samfrazerdutton/zero-trust-fhe-api.git)
    cd zero-trust-fhe-api
 Install Python dependencies:
 pip install -r requirements.txt
